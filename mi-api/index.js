@@ -11,6 +11,12 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
+const diferenciaEnDias = (fecha1, fecha2) => {
+  const unDia = 1000 * 60 * 60 * 24;
+  const diferencia = Math.round(Math.abs((fecha1 - fecha2) / unDia));
+  return diferencia;
+};
+
 const verificarToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -28,8 +34,10 @@ const verificarToken = (req, res, next) => {
   });
 };
 
+// --- INICIO DE LA CORRECCIÓN: Lógica para actualizar la tabla existente ---
 const iniciarDB = async () => {
   try {
+    // 1. Asegurarse de que la tabla 'usuarios' existe (sin las nuevas columnas)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS usuarios (
         id SERIAL PRIMARY KEY,
@@ -42,6 +50,29 @@ const iniciarDB = async () => {
       );
     `);
 
+    // 2. Comprobar si la columna 'racha' existe y añadirla si no
+    const rachaCheck = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name='usuarios' AND column_name='racha';
+    `);
+    if (rachaCheck.rows.length === 0) {
+      await pool.query('ALTER TABLE usuarios ADD COLUMN racha INTEGER DEFAULT 0;');
+      console.log("Columna 'racha' añadida a la tabla 'usuarios'.");
+    }
+
+    // 3. Comprobar si la columna 'ultima_conexion' existe y añadirla si no
+    const ultimaConexionCheck = await pool.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name='usuarios' AND column_name='ultima_conexion';
+    `);
+    if (ultimaConexionCheck.rows.length === 0) {
+      await pool.query('ALTER TABLE usuarios ADD COLUMN ultima_conexion DATE;');
+      console.log("Columna 'ultima_conexion' añadida a la tabla 'usuarios'.");
+    }
+
+    // 4. Asegurarse de que la tabla 'tareas' existe
     await pool.query(`
       CREATE TABLE IF NOT EXISTS tareas (
         id SERIAL PRIMARY KEY,
@@ -52,11 +83,12 @@ const iniciarDB = async () => {
         FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
       );
     `);
-    console.log("Tablas 'usuarios' y 'tareas' verificadas.");
+    console.log("Tablas 'usuarios' y 'tareas' verificadas y actualizadas.");
   } catch (err) {
     console.error("Error al iniciar la base de datos:", err);
   }
 };
+// --- FIN DE LA CORRECCIÓN ---
 iniciarDB();
 
 app.post('/usuarios', async (req, res) => {
@@ -68,7 +100,7 @@ app.post('/usuarios', async (req, res) => {
     const result = await pool.query(
       `INSERT INTO usuarios (nombre, correo, contrasena, fecha)
        VALUES ($1, $2, $3, $4)
-       RETURNING id, nombre, correo, fecha, nivel, rol`,
+       RETURNING id, nombre, correo, fecha, nivel, rol, racha`,
       [nombre, correo, contrasenaHasheada, fecha]
     );
 
@@ -91,11 +123,34 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'Credenciales incorrectas' });
     }
 
-    const usuario = result.rows[0];
+    let usuario = result.rows[0];
     const esContrasenaValida = await bcrypt.compare(contrasena, usuario.contrasena);
 
     if (!esContrasenaValida) {
       return res.status(401).json({ message: 'Credenciales incorrectas' });
+    }
+
+    if (usuario.rol === 'superuser') {
+      const hoy = new Date();
+      const ultimaConexion = usuario.ultima_conexion ? new Date(usuario.ultima_conexion) : null;
+      let nuevaRacha = usuario.racha || 0;
+
+      if (ultimaConexion) {
+        const diasDesdeUltimaConexion = diferenciaEnDias(hoy, ultimaConexion);
+        if (diasDesdeUltimaConexion === 1) {
+          nuevaRacha++;
+        } else if (diasDesdeUltimaConexion > 1) {
+          nuevaRacha = 1;
+        }
+      } else {
+        nuevaRacha = 1;
+      }
+      
+      const updateResult = await pool.query(
+        'UPDATE usuarios SET racha = $1, ultima_conexion = $2 WHERE id = $3 RETURNING *',
+        [nuevaRacha, hoy.toISOString().split('T')[0], usuario.id]
+      );
+      usuario = updateResult.rows[0];
     }
 
     const payload = { id: usuario.id, rol: usuario.rol };
@@ -114,9 +169,10 @@ app.post('/login', async (req, res) => {
   }
 });
 
+
 app.get('/usuarios', verificarToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, nombre, correo, fecha, nivel, rol FROM usuarios');
+    const result = await pool.query('SELECT id, nombre, correo, fecha, nivel, rol, racha FROM usuarios');
     res.json(result.rows);
   } catch (err) {
     res.status(500).send(err);
@@ -126,7 +182,7 @@ app.get('/usuarios', verificarToken, async (req, res) => {
 app.get('/usuarios/:id', verificarToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, nombre, correo, fecha, nivel, rol FROM usuarios WHERE id = $1',
+      'SELECT id, nombre, correo, fecha, nivel, rol, racha FROM usuarios WHERE id = $1',
       [req.params.id]
     );
     if (result.rows.length === 0) {
@@ -141,7 +197,7 @@ app.get('/usuarios/:id', verificarToken, async (req, res) => {
 app.get('/usuarios/email/:correo', verificarToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, nombre, correo, fecha, nivel, rol FROM usuarios WHERE correo = $1',
+      'SELECT id, nombre, correo, fecha, nivel, rol, racha FROM usuarios WHERE correo = $1',
       [req.params.correo]
     );
     if (result.rows.length === 0) {
@@ -162,16 +218,20 @@ app.patch('/usuarios/admin/:id', verificarToken, async (req, res) => {
     const { id } = req.params;
     let { nombre, correo, fecha, nivel, rol, contrasena } = req.body;
 
+    if (!['admin', 'moderador', 'usuario', 'superuser'].includes(rol)) {
+        return res.status(400).json({ message: 'Rol no válido.' });
+    }
+
     let query;
     let values;
 
     if (contrasena && contrasena.trim() !== '') {
       const salt = await bcrypt.genSalt(10);
       const contrasenaHasheada = await bcrypt.hash(contrasena, salt);
-      query = `UPDATE usuarios SET nombre = $1, correo = $2, fecha = $3, nivel = $4, rol = $5, contrasena = $6 WHERE id = $7 RETURNING id, nombre, correo, fecha, nivel, rol`;
+      query = `UPDATE usuarios SET nombre = $1, correo = $2, fecha = $3, nivel = $4, rol = $5, contrasena = $6 WHERE id = $7 RETURNING id, nombre, correo, fecha, nivel, rol, racha`;
       values = [nombre, correo, fecha, nivel, rol, contrasenaHasheada, id];
     } else {
-      query = `UPDATE usuarios SET nombre = $1, correo = $2, fecha = $3, nivel = $4, rol = $5 WHERE id = $6 RETURNING id, nombre, correo, fecha, nivel, rol`;
+      query = `UPDATE usuarios SET nombre = $1, correo = $2, fecha = $3, nivel = $4, rol = $5 WHERE id = $6 RETURNING id, nombre, correo, fecha, nivel, rol, racha`;
       values = [nombre, correo, fecha, nivel, rol, id];
     }
     
@@ -200,7 +260,7 @@ app.patch('/usuarios/moderador/:id', verificarToken, async (req, res) => {
     const { nombre, fecha } = req.body;
 
     const result = await pool.query(
-      `UPDATE usuarios SET nombre = $1, fecha = $2 WHERE id = $3 RETURNING id, nombre, correo, fecha, nivel, rol`,
+      `UPDATE usuarios SET nombre = $1, fecha = $2 WHERE id = $3 RETURNING id, nombre, correo, fecha, nivel, rol, racha`,
       [nombre, fecha, id]
     );
 
@@ -283,22 +343,38 @@ app.post('/tareas', async (req, res) => {
   }
 });
 
-app.put('/tareas/:id', async (req, res) => {
+app.patch('/tareas/:id', async (req, res) => {
   try {
-    const { usuario_id, descripcion, puntos, completado } = req.body;
-    const result = await pool.query(
-      `UPDATE tareas
-       SET usuario_id = $1, descripcion = $2, puntos = $3, completado = $4
-       WHERE id = $5
-       RETURNING *`,
-      [usuario_id, descripcion, puntos, completado, req.params.id]
-    );
+    const { id } = req.params;
+    const updates = req.body;
+    const allowedUpdates = ['usuario_id', 'descripcion', 'puntos', 'completado'];
+    const queryParts = [];
+    const values = [];
+    let valueIndex = 1;
+
+    for (const key in updates) {
+      if (allowedUpdates.includes(key)) {
+        queryParts.push(`${key} = $${valueIndex++}`);
+        values.push(updates[key]);
+      }
+    }
+
+    if (queryParts.length === 0) {
+      return res.status(400).json({ message: 'No hay campos válidos para actualizar.' });
+    }
+
+    values.push(id);
+    const queryString = `UPDATE tareas SET ${queryParts.join(', ')} WHERE id = $${valueIndex} RETURNING *`;
+    
+    const result = await pool.query(queryString, values);
+
     if (result.rows.length === 0) {
       return res.status(404).json({ message: 'Tarea no encontrada' });
     }
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).send(err);
+    console.error("Error en PATCH /tareas/:id:", err);
+    res.status(500).json({ message: 'Error interno del servidor.' });
   }
 });
 
@@ -316,13 +392,6 @@ app.delete('/tareas/:id', async (req, res) => {
     res.status(500).send(err);
   }
 });
-
-
-//serveer
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor corriendo en puerto ${PORT}`);
-});
-
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor corriendo en puerto ${PORT}`);
